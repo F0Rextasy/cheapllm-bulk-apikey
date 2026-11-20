@@ -62,15 +62,38 @@ async function ensureProviderNode(base, cookie, { name, prefix, baseUrl }) {
   return { node: created.json.node, created: true };
 }
 
-async function ensureConnection(base, cookie, { nodeId, name, apiKey, defaultModel }) {
+/**
+ * One proxy pool per account exit, bound to that account's connection. The
+ * pool is created with strictProxy so a dead exit errors instead of letting the
+ * router send the request out of the machine's own address.
+ */
+async function ensureProxyPool(base, cookie, { name, proxyUrl }) {
+  const list = await apiCall(base, cookie, '/api/proxy-pools?includeUsage=true');
+  const pools = Array.isArray(list.json) ? list.json : (list.json && (list.json.proxyPools || list.json.pools)) || [];
+  const existing = pools.find((p) => p.name === name);
+  if (existing) return { pool: existing, created: false };
+  const type = /^socks/i.test(proxyUrl) ? 'socks5' : 'http';
+  const created = await apiCall(base, cookie, '/api/proxy-pools', {
+    method: 'POST',
+    body: JSON.stringify({ name, proxyUrl, type, strictProxy: true, isActive: true }),
+  });
+  if (!created.ok) throw new Error(`create proxy pool failed ${created.status}: ${created.text}`);
+  return { pool: created.json, created: true };
+}
+
+async function ensureConnection(base, cookie, { nodeId, name, apiKey, defaultModel, proxyPoolId }) {
   const list = await apiCall(base, cookie, '/api/providers');
   const conns = (list.json && list.json.connections) || [];
   const existing = conns.find((c) => c.provider === nodeId && c.name === name);
   if (existing) return { connection: existing, created: false };
-  const created = await apiCall(base, cookie, '/api/providers', {
-    method: 'POST',
-    body: JSON.stringify({ provider: nodeId, apiKey, name, priority: 1, defaultModel: defaultModel || null }),
-  });
+  const body = { provider: nodeId, apiKey, name, priority: 1, defaultModel: defaultModel || null };
+  if (proxyPoolId) body.proxyPoolId = proxyPoolId;
+  // POST /api/connections on current 9router builds; older upstream answers
+  // only /api/providers, so a 404/405 there is retried once on the other path.
+  let created = await apiCall(base, cookie, '/api/connections', { method: 'POST', body: JSON.stringify(body) });
+  if (created.status === 404 || created.status === 405) {
+    created = await apiCall(base, cookie, '/api/providers', { method: 'POST', body: JSON.stringify(body) });
+  }
   if (!created.ok && created.status !== 409) {
     throw new Error(`create connection failed ${created.status}: ${created.text}`);
   }
@@ -113,17 +136,34 @@ async function connectBulk({
   base = 'http://localhost:20128',
   password = '123456',
   keysFile,
+  accountsFile = 'outputs/accounts.jsonl',
   prefix = 'cheapllm',
   baseUrl = 'https://cheapllm.shop/v1',
   defaultModel = 'deepseek-v4.1-flash-1017',
 }) {
-  const keys = fs.readFileSync(keysFile, 'utf8')
+  const keys = fs
+    .readFileSync(keysFile, 'utf8')
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#'))
     .map((l) => l.split(/[\s,]+/)[0]);
 
-  console.log(`connecting ${keys.length} keys to 9Router at ${base}`);
+  // Account records carry the exit each key was minted on. Binding that exit to
+  // the connection keeps the panel request on the same address as the signup.
+  const exits = new Map();
+  if (accountsFile && fs.existsSync(accountsFile)) {
+    for (const line of fs.readFileSync(accountsFile, 'utf8').split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const row = JSON.parse(line);
+        if (row.key && row.exit && row.exit !== 'direct') exits.set(row.key, row.exit);
+      } catch (e) {
+        /* a half-written ledger line is skipped, not fatal */
+      }
+    }
+  }
+
+  console.log(`connecting ${keys.length} keys to 9Router at ${base} (${exits.size} with a dedicated exit)`);
   const { ok, cookie, body } = await login(base, password);
   if (!ok && !/already|success|ok/i.test(body)) throw new Error(`9Router login failed: ${body}`);
   const { node } = await ensureProviderNode(base, cookie, { name: 'cheapllm', prefix, baseUrl });
@@ -133,9 +173,15 @@ async function connectBulk({
     const key = keys[i];
     const name = `${prefix}-${String(i + 1).padStart(3, '0')}`;
     try {
-      const { connection, created } = await ensureConnection(base, cookie, { nodeId: node.id, name, apiKey: key, defaultModel });
-      results.push({ i: i + 1, key: key.slice(0, 16) + '…', connectionId: connection && connection.id, created });
-      console.log(`  [${i + 1}/${keys.length}] ${name} -> ${created ? 'created' : 'exists'}`);
+      let proxyPoolId = null;
+      const exitLine = exits.get(key);
+      if (exitLine) {
+        const pool = await ensureProxyPool(base, cookie, { name: `${prefix}-exit-${String(i + 1).padStart(3, '0')}`, proxyUrl: exitLine });
+        proxyPoolId = pool.pool && pool.pool.id;
+      }
+      const { connection, created } = await ensureConnection(base, cookie, { nodeId: node.id, name, apiKey: key, defaultModel, proxyPoolId });
+      results.push({ i: i + 1, key: key.slice(0, 16) + '…', connectionId: connection && connection.id, proxyPoolId, created });
+      console.log(`  [${i + 1}/${keys.length}] ${name} -> ${created ? 'created' : 'exists'}${proxyPoolId ? ' (exit pinned)' : ''}`);
     } catch (e) {
       console.error(`  [${i + 1}/${keys.length}] ${name} -> FAILED: ${e.message}`);
       results.push({ i: i + 1, key: key.slice(0, 16) + '…', error: e.message });
@@ -165,6 +211,7 @@ module.exports = {
   login,
   apiCall,
   ensureProviderNode,
+  ensureProxyPool,
   ensureConnection,
   ensureClientKey,
   connect,
@@ -175,20 +222,23 @@ module.exports = {
 
 
 if (require.main === module) {
-  const args = Object.fromEntries(
-    process.argv
-      .slice(2)
-      .map((a) => a.replace(/^--/, '').split('='))
-      .map(([k, v]) => [k, v === undefined ? true : v]),
-  );
+  const argv = process.argv.slice(2);
+  const args = {};
+  for (let i = 0; i < argv.length; i++) {
+    const m = argv[i].match(/^--([^=]+)(?:=(.*))?$/);
+    if (!m) continue;
+    const next = argv[i + 1];
+    args[m[1]] = m[2] !== undefined ? m[2] : next && !next.startsWith('--') ? argv[++i] : true;
+  }
   if (args.help) {
-    console.log('Usage: node src/connect-9router.js --keys keys.txt [--base http://localhost:20128] [--password 123456] [--model deepseek-v4.1-flash-1017]');
+    console.log('Usage: node src/connect-9router.js --keys keys.txt [--accounts outputs/accounts.jsonl] [--base http://localhost:20128] [--password 123456] [--model deepseek-v4.1-flash-1017]');
     process.exit(0);
   }
   connectBulk({
     base: args.base || 'http://localhost:20128',
     password: args.password || '123456',
     keysFile: args.keys || 'keys.txt',
+    accountsFile: args.accounts || 'outputs/accounts.jsonl',
     prefix: args.prefix || 'cheapllm',
     baseUrl: args.url || 'https://cheapllm.shop/v1',
     defaultModel: args.model || 'deepseek-v4.1-flash-1017',

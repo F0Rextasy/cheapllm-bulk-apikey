@@ -1,0 +1,42 @@
+{
+  "name": "cheapllm-bulk-apikey",
+  "version": "1.0.0",
+  "description": "Bulk-mint cheapllm.shop API keys — one account per key, e-mail confirm link read automatically, no captcha — and connect them to 9Router.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "cheapllm-bulk": "src/cli.js",
+    "cheapllm-bulk-launcher": "src/launcher.js"
+  },
+  "main": "src/lib/panel.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/launcher.js",
+    "mint": "node src/cli.js --count 1 --auto",
+    "verify": "node src/cli.js verify",
+    "9router": "node src/connect-9router.js",
+    "connect-9router": "node src/connect-9router.js"
+  },
+  "keywords": [
+    "cheapllm",
+    "deepseek",
+    "api-keys",
+    "bulk",
+    "openai-compatible",
+    "llm",
+    "9router",
+    "proxy",
+    "nodejs"
+  ],
+  "files": [
+    "src",
+    "docs",
+    "examples",
+    "i18n",
+    "README.md",
+    "LICENSE"
+  ],
+  "author": "cheapllm-bulk-apikey contributors"
+}

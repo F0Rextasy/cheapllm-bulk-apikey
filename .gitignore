@@ -1,0 +1,9 @@
+# run outputs — never commit keys, accounts, proxies or ledgers
+outputs/
+keys.txt
+keys-*.txt
+accounts.jsonl
+proxies.txt
+launcher.config.json
+node_modules/
+*.log

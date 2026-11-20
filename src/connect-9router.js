@@ -79,7 +79,7 @@ async function ensureConnection(base, cookie, { nodeId, name, apiKey, defaultMod
 
 async function ensureClientKey(base, cookie, name = 'cheapllm') {
   const list = await apiCall(base, cookie, '/api/keys');
-  const keys = (list.json && list.json.keys) || [];
+  const keys = Array.isArray(list.json) ? list.json : (list.json && list.json.keys) || [];
   const existing = keys.find((k) => k.name === name && k.isActive);
   if (existing) return { key: existing.key, created: false };
   const created = await apiCall(base, cookie, '/api/keys', {
